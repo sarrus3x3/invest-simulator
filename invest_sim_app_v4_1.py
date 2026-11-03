@@ -430,8 +430,8 @@ with tab_sim:
                        f"元本割れ {(v < pr).sum():,}営業日")
     chart = pd.DataFrame(index=sim.index)
     for n in targets:
-        chart[f"{n}（評価額）"] = sim[f"{n}_評価額"]
-        chart[f"{n}（元本）"] = sim[f"{n}_元本"]
+        chart[f"{n}_評価額"] = sim[f"{n}_評価額"]
+        chart[f"{n}_元本"] = sim[f"{n}_元本"]
     st.line_chart(chart)
 
 st.caption("※ 手数料・税金は考慮していません。ETF・指数で投資信託を近似したものです。"
