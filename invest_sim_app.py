@@ -1,5 +1,10 @@
 """
-過去相場シミュレーター v4.1（Streamlit）
+過去相場シミュレーター v4.2（Streamlit）
+v4.2 の修正点:
+- MSCI公式CSV（先頭に注意書き行がある形式）を正しく読み込む（"Date" の行をヘッダーとして自動検出）。
+- 上記CSVで、グラフ描画が ValueError で落ちる問題を修正（日付の列名に ":" が入っていたため）。
+- MSCI CSV の Index Level（Net / Gross / Price）と通貨を読み取り、配当込みの初期値に反映。
+
 - 株価・為替データは、スクリプトと同じ場所の data フォルダに CSV で保存して使う。
 - 更新は「追記のみ」。保存済みの過去データは上書きしない（更新前にバックアップも作成）。
 - 過去データが取得元で変わっていた場合は、件数を警告で表示する。
@@ -9,19 +14,20 @@
 
 起動:
     python -m pip install streamlit pandas yfinance
-    python -m streamlit run invest_sim_app_v4_1.py
+    python -m streamlit run invest_sim_app_v4_2.py
 
 フォルダ構成:
-    invest_sim_app_v4_1.py
+    invest_sim_app_v4_2.py
     data/
-        ACWI.csv ← アプリが yfinance から取得して保存（Close＋Dividends）
-        USDJPY.csv ← アプリが yfinance から取得して保存
-        FRED_DEXJPUS.csv ← アプリが FRED から取得して保存（1971〜）
-        msci_acwi_net.csv ← MSCI公式サイトから手動ダウンロードして置く（名前は任意）
-        backup/ ← 更新前の自動バックアップ
+        ACWI.csv            ← アプリが yfinance から取得して保存（Close＋Dividends）
+        USDJPY.csv          ← アプリが yfinance から取得して保存
+        FRED_DEXJPUS.csv    ← アプリが FRED から取得して保存（1971〜）
+        msci_acwi_net.csv   ← MSCI公式サイトから手動ダウンロードして置く（名前は任意）
+        backup/             ← 更新前の自動バックアップ
 """
 from __future__ import annotations
 
+import csv
 import datetime as dt
 import io
 import shutil
@@ -41,6 +47,12 @@ CLOSE_COLS = ["Close", "close", "終値", "Price", "price", "DEXJPUS"]
 ADJ_COLS = ["Adj Close", "Adj_Close", "adj_close", "調整後終値"]
 DIV_COLS = ["Dividends", "dividends", "配当"]
 
+LEVEL_LABELS = {
+    "Net": "Net（配当込み・税引後）",
+    "Gross": "Gross（配当込み・税引前）",
+    "Price": "Price（配当なし）",
+}
+
 CRASH_EVENTS = {
     1990: "湾岸危機・日本バブル崩壊",
     2000: "ITバブル崩壊（〜2002）",
@@ -52,21 +64,44 @@ CRASH_EVENTS = {
     2022: "利上げ相場",
 }
 
+
 # ---------------------------------------------------------------- データ（読み込み）
 def _num(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s.astype(str).str.replace(",", ""), errors="coerce")
 
+
 def parse_csv_bytes(raw: bytes) -> pd.DataFrame:
-    """CSV → DataFrame(index=日付, columns=['close','adj'])。attrs['kind'] に配当の扱いを記録。"""
-    df = None
+    """CSV → DataFrame(index=日付, columns=['close','adj'])。
+    attrs['kind'] に配当の扱い、attrs['meta'] に MSCI 形式のメタ情報（level/currency）を記録。"""
+    text = None
     for enc in ("utf-8-sig", "cp932"):
         try:
-            df = pd.read_csv(io.BytesIO(raw), encoding=enc)
+            text = raw.decode(enc)
             break
-        except Exception:
+        except UnicodeDecodeError:
             continue
-    if df is None:
-        raise ValueError("CSVを読み込めませんでした")
+    if text is None:
+        raise ValueError("CSVを読み込めませんでした（文字コードを確認してください）")
+    lines = text.splitlines()
+
+    # MSCI形式: 先頭に注意書き・メタ情報の行があり、"Date,..." の行がヘッダー
+    header_idx, meta = 0, {}
+    for i, ln in enumerate(lines[:60]):
+        cells = next(csv.reader([ln]), [])
+        first = cells[0].strip() if cells else ""
+        if first in DATE_COLS:
+            header_idx = i
+            break
+        key = first.rstrip(":").strip().lower()
+        if key == "index level" and len(cells) > 1:
+            meta["level"] = cells[1].strip()
+        elif key == "currency" and len(cells) > 1:
+            meta["currency"] = cells[1].strip()
+    try:
+        df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f"CSVを読み込めませんでした: {e}") from e
+
     date_col = next((c for c in DATE_COLS if c in df.columns), df.columns[0])
     close_col = next((c for c in CLOSE_COLS if c in df.columns), None)
     adj_col = next((c for c in ADJ_COLS if c in df.columns), None)
@@ -74,7 +109,7 @@ def parse_csv_bytes(raw: bytes) -> pd.DataFrame:
     if close_col is None and adj_col is None:
         if len(df.columns) < 2:
             raise ValueError(f"値の列が見つかりません。列名: {list(df.columns)}")
-        close_col = df.columns[1] # MSCI等の独自列名は2列目を値とみなす
+        close_col = df.columns[1]  # MSCI等の独自列名は2列目を値とみなす
 
     idx = pd.to_datetime(df[date_col], errors="coerce")
     close = pd.Series(_num(df[close_col] if close_col else df[adj_col]).values, index=idx)
@@ -88,27 +123,33 @@ def parse_csv_bytes(raw: bytes) -> pd.DataFrame:
     if out.empty:
         raise ValueError("有効なデータ行がありません")
 
-    if "div" in out: # 終値＋配当 → 配当再投資の系列を自前で計算
+    if "div" in out:  # 終値＋配当 → 配当再投資の系列を自前で計算
         r = (out["close"] + out["div"]) / out["close"].shift(1)
         r.iloc[0] = 1.0
         out["adj"] = out["close"].iloc[0] * r.cumprod()
-        out.attrs["kind"] = "dividends"
         out = out.drop(columns="div")
+        kind = "dividends"
     elif "adj" in out:
         out["adj"] = out["adj"].fillna(out["close"])
-        out.attrs["kind"] = "adj"
+        kind = "adj"
     else:
         out["adj"] = out["close"]
-        out.attrs["kind"] = "plain"
+        kind = "plain"
+    out.index.name = "Date"  # 元の列名（例: "Index Level:"）をグラフ側に持ち込まない
+    out.attrs["kind"] = kind
+    out.attrs["meta"] = meta
     return out
 
+
 @st.cache_data
-def load_local(name: str, mtime: float) -> pd.DataFrame: # mtime はキャッシュ更新用
+def load_local(name: str, mtime: float) -> pd.DataFrame:  # mtime はキャッシュ更新用
     return parse_csv_bytes((DATA_DIR / name).read_bytes())
+
 
 def list_csvs() -> list[str]:
     DATA_DIR.mkdir(exist_ok=True)
     return sorted(p.name for p in DATA_DIR.glob("*.csv"))
+
 
 # ---------------------------------------------------------------- データ（取得・追記保存）
 def fetch_yf_raw(ticker: str, start: str = "1970-01-01") -> pd.DataFrame:
@@ -125,6 +166,7 @@ def fetch_yf_raw(ticker: str, start: str = "1970-01-01") -> pd.DataFrame:
     out.index.name = "Date"
     return out.dropna(subset=["Close"])
 
+
 def fetch_fred_dexjpus() -> pd.DataFrame:
     url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DEXJPUS"
     df = pd.read_csv(url)
@@ -133,6 +175,7 @@ def fetch_fred_dexjpus() -> pd.DataFrame:
                        index=pd.to_datetime(df[date_col]))
     out.index.name = "Date"
     return out.dropna()
+
 
 def merge_and_save(name: str, new: pd.DataFrame) -> tuple[int, int]:
     """追記のみで保存。戻り値: (追加行数, 過去データの食い違い件数)"""
@@ -152,6 +195,7 @@ def merge_and_save(name: str, new: pd.DataFrame) -> tuple[int, int]:
     merged.to_csv(path)
     return len(added), diff
 
+
 @st.cache_data
 def make_dummy() -> tuple[pd.DataFrame, pd.DataFrame]:
     """動作確認用の人工データ（実際の相場ではない）"""
@@ -166,6 +210,7 @@ def make_dummy() -> tuple[pd.DataFrame, pd.DataFrame]:
     fx = pd.Series(110 * np.exp(np.cumsum(rng.normal(0, 0.004, len(idx)))), index=idx)
     return pd.DataFrame({"close": c, "adj": a}), pd.DataFrame({"close": fx, "adj": fx})
 
+
 def build_series(px, fx, use_div, use_fx) -> pd.Series:
     s = px["adj" if use_div else "close"].copy()
     if use_fx:
@@ -174,14 +219,16 @@ def build_series(px, fx, use_div, use_fx) -> pd.Series:
         r = fx["close"].reindex(s.index.union(fx.index)).ffill().reindex(s.index).bfill()
         s = s * r
     s.name = "price"
+    s.index.name = "Date"
     return s
+
 
 # ---------------------------------------------------------------- 計算
 def simulate(p_all, start, years, method, lump, monthly) -> pd.DataFrame:
     end = start + pd.DateOffset(years=years)
     p = p_all[(p_all.index >= start) & (p_all.index < end)]
     if len(p) < 20:
-        raise ValueError("選択した期間のデータが不足しています")
+        raise ValueError("選択した期間のデータが不足しています（月次データの場合は運用期間を2年以上にしてください）")
     out = pd.DataFrame(index=p.index)
     if method in ("一括", "比較"):
         out["一括_評価額"] = lump / p.iloc[0] * p
@@ -194,6 +241,7 @@ def simulate(p_all, start, years, method, lump, monthly) -> pd.DataFrame:
         out["積立_元本"] = pd.Series(monthly, index=p.index).where(p.index.isin(buy), 0).cumsum()
     return out
 
+
 def heatmap_table(p: pd.Series, max_years: int) -> pd.DataFrame:
     """開始年 × 保有年数の損益率と、元本割れ関連の指標（一括投資）"""
     rows = []
@@ -203,7 +251,7 @@ def heatmap_table(p: pd.Series, max_years: int) -> pd.DataFrame:
         if sub.empty or sub.index[0].year != y:
             continue
         t0, p0 = sub.index[0], sub.iloc[0]
-        if t0 > pd.Timestamp(y, 1, 31): # 年初データがない年は除外
+        if t0 > pd.Timestamp(y, 1, 31):  # 年初データがない年は除外
             continue
         rel = sub / p0
         row = {"開始年": y}
@@ -230,14 +278,16 @@ def heatmap_table(p: pd.Series, max_years: int) -> pd.DataFrame:
         rows.append(row)
     return pd.DataFrame(rows).set_index("開始年")
 
+
 def cell_color(v: float) -> str:
     if pd.isna(v):
         return "#f0f0f0"
     if v >= 0:
-        a = min(v / 1.5, 1.0) # +150%で最も濃い緑
+        a = min(v / 1.5, 1.0)  # +150%で最も濃い緑
         return f"rgba(34,139,34,{0.15 + 0.75 * a:.2f})"
-    a = min(-v / 0.5, 1.0) # -50%で最も濃い赤
+    a = min(-v / 0.5, 1.0)  # -50%で最も濃い赤
     return f"rgba(220,20,60,{0.15 + 0.75 * a:.2f})"
+
 
 def heatmap_frame(tbl: pd.DataFrame, years: list[int], mode: str, amount: float):
     """表示用の表（Styler）。HTMLタグを使わずに色付けする。"""
@@ -266,8 +316,10 @@ def heatmap_frame(tbl: pd.DataFrame, years: list[int], mode: str, amount: float)
     return (view.style.apply(bg, axis=None, subset=num_cols)
             .format(fmt, subset=num_cols, na_rep=""))
 
+
 def yen(x):
     return f"{x:,.0f} 円"
+
 
 # ---------------------------------------------------------------- サイドバー
 st.title("📈 過去相場シミュレーター")
@@ -287,7 +339,7 @@ with st.sidebar:
                     st.warning(f"保存済みの過去データと取得元で {d:,} 件の値の食い違いがありました（保存側は変更していません）")
             except ImportError:
                 st.error("yfinance 未インストールです")
-            except Exception as e: # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
                 st.error(f"取得エラー: {e}")
         c1, c2 = st.columns(2)
         if c1.button("ドル円（Yahoo）"):
@@ -296,7 +348,7 @@ with st.sidebar:
                 st.success(f"USDJPY.csv に {n:,} 行追加")
                 if d:
                     st.warning(f"過去データの食い違い {d:,} 件（保存側は変更なし）")
-            except Exception as e: # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
                 st.error(f"取得エラー: {e}")
         if c2.button("ドル円（FRED 1971〜）"):
             try:
@@ -304,7 +356,7 @@ with st.sidebar:
                 st.success(f"FRED_DEXJPUS.csv に {n:,} 行追加")
                 if d:
                     st.warning(f"過去データの食い違い {d:,} 件（保存側は変更なし）")
-            except Exception as e: # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
                 st.error(f"取得エラー: {e}")
         up = st.file_uploader("手動ダウンロードしたCSVを data に保存（MSCI等）", type=["csv"])
         if up is not None and st.button("このCSVを保存"):
@@ -332,19 +384,23 @@ with st.sidebar:
         try:
             px = load_local(price_file, (DATA_DIR / price_file).stat().st_mtime)
             kind = px.attrs.get("kind")
+            meta = px.attrs.get("meta", {})
             if kind == "dividends":
                 use_div = st.checkbox("配当を含める（配当再投資で計算）", value=True)
             elif kind == "adj":
                 use_div = st.checkbox("配当を含める（Adj Close を使用）", value=True)
             else:
-                use_div = st.checkbox("このファイルは配当込みの指数（MSCI Net 等）", value=True,
+                lvl = meta.get("level")
+                if lvl:
+                    st.caption(f"ファイル情報：{LEVEL_LABELS.get(lvl, lvl)}／通貨 {meta.get('currency', '不明')}")
+                use_div = st.checkbox("このファイルは配当込みの指数（MSCI Net 等）", value=(lvl != "Price"),
                                       help="値そのものが配当込みならオン。オフなら配当なしとして表示。")
                 px = px.assign(adj=px["close"])
             if use_fx:
                 fx_file = st.selectbox("ドル円のファイル", files,
                                        index=_default(["FRED_DEXJPUS.csv", "USDJPY.csv"]))
                 fx = load_local(fx_file, (DATA_DIR / fx_file).stat().st_mtime)
-        except Exception as e: # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             st.error(f"データ読み込みエラー: {e}")
             px = None
 
@@ -353,7 +409,7 @@ with st.sidebar:
         try:
             prices = build_series(px, fx, use_div, use_fx)
             st.success(f"{prices.index.min():%Y-%m-%d} 〜 {prices.index.max():%Y-%m-%d}")
-        except Exception as e: # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             st.error(str(e))
 
 if prices is None:
@@ -373,7 +429,8 @@ with tab_hm:
                              disabled=(mode == "損益率"))
     max_y = c3.slider("最大保有年数", 5, 30, 20)
     step = st.radio("表示する保有年数", ["毎年", "1・3・5・10・15・20…年"], horizontal=True)
-    years = list(range(1, max_y + 1)) if step == "毎年" else         [y for y in [1, 2, 3, 5, 7, 10, 15, 20, 25, 30] if y <= max_y]
+    years = list(range(1, max_y + 1)) if step == "毎年" else \
+        [y for y in [1, 2, 3, 5, 7, 10, 15, 20, 25, 30] if y <= max_y]
 
     tbl = heatmap_table(prices, max_y)
     if tbl.empty:
@@ -430,8 +487,9 @@ with tab_sim:
                        f"元本割れ {(v < pr).sum():,}営業日")
     chart = pd.DataFrame(index=sim.index)
     for n in targets:
-        chart[f"{n}_評価額"] = sim[f"{n}_評価額"]
-        chart[f"{n}_元本"] = sim[f"{n}_元本"]
+        chart[f"{n}（評価額）"] = sim[f"{n}_評価額"]
+        chart[f"{n}（元本）"] = sim[f"{n}_元本"]
+    chart.index.name = "日付"  # 列名に ":" などが入るとグラフ描画（altair）が失敗するため固定
     st.line_chart(chart)
 
 st.caption("※ 手数料・税金は考慮していません。ETF・指数で投資信託を近似したものです。"
